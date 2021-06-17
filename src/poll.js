@@ -107,7 +107,7 @@ function pollInstallDistTag({ name, onError, tag, period = 20, dependencies = fa
     const stability : { [string] : string } = {};
 
     const pollInstall = async () : Promise<ModuleDetails> => {
-        const moduleInfo = await info(name, { logger, cache, registry, cdnRegistry });
+        const { moduleInfo } = await info(name, { logger, cache, registry, cdnRegistry });
 
         let distTagVersion = moduleInfo[DIST_TAGS][tag];
 
@@ -179,7 +179,8 @@ function pollInstallDistTag({ name, onError, tag, period = 20, dependencies = fa
         }
 
         const version = distTagVersion;
-        const liveModulesDir = await createHomeDirectory(LIVE_MODULES_DIR_NAME);
+        const cdnRegistryLabel = cdnRegistry ? new URL(cdnRegistry).hostname : '';
+        const liveModulesDir = await createHomeDirectory(join(LIVE_MODULES_DIR_NAME, cdnRegistryLabel));
         const prefix = join(liveModulesDir, `${ cleanName(moduleInfo.name) }_${ version }`);
 
         cleanTask = cleanTask || cleanDirectoryTask({
@@ -275,6 +276,11 @@ export async function getFallback(name : string) : Promise<ModuleDetails> {
 
     for (const dependencyName of Object.keys(pkg.dependencies || {})) {
         const dependencyPath = resolveModuleDirectory(dependencyName, [ modulePath ]); // join(nodeModulesPath, dependencyName);
+
+        if (!dependencyPath) {
+            throw new Error(`Can not resolve dependency for fallback: ${ dependencyName } / ${ modulePath }`);
+        }
+
         // $FlowFixMe
         const dependencyPkg = require(join(dependencyPath, PACKAGE_JSON)); // eslint-disable-line security/detect-non-literal-require
 
@@ -362,16 +368,16 @@ export function npmPoll({ name, tags = [ DIST_TAG.LATEST ], onError, period = NP
 
     const readCache = new LRU(20);
 
-    async function pollerRead(path? : string = '') : Promise<string> {
+    async function pollerRead(path? : string, tag? : ?string) : Promise<string> {
         return await withPoller(async ({ modulePath }) => {
-            const filePath = join(modulePath, path);
+            const filePath = join(modulePath, path || '');
             if (readCache.has(filePath)) {
                 return readCache.get(filePath);
             }
             const file = await readFile(filePath);
             readCache.set(filePath, file);
             return file;
-        });
+        }, tag);
     }
 
     function pollerCancel() {

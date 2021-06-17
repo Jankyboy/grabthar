@@ -3,14 +3,14 @@
 
 import { join } from 'path';
 
-import { ensureDir, move, existsSync, exists, ensureFileSync } from 'fs-extra';
+import { ensureDir, move, exists, readdir } from 'fs-extra';
 import download from 'download';
 import fetch from 'node-fetch';
 
 import type { CacheType, LoggerType } from './types';
 import { NPM_REGISTRY, CDN_REGISTRY_INFO_FILENAME, CDN_REGISTRY_INFO_CACHEBUST_URL_TIME, INFO_MEMORY_CACHE_LIFETIME } from './config';
 import { NODE_MODULES, PACKAGE, PACKAGE_JSON, LOCK } from './constants';
-import { sanitizeString, cacheReadWrite, rmrf, withFileSystemLock, isValidDependencyVersion, memoizePromise, tryRmrf, tryRemove, getTemporaryDirectory } from './util';
+import { sanitizeString, cacheReadWrite, rmrf, withFileSystemLock, isValidDependencyVersion, memoizePromise, tryRmrf, getTemporaryDirectory } from './util';
 
 process.env.NO_UPDATE_NOTIFIER = 'true';
 
@@ -56,7 +56,12 @@ type InfoOptions = {|
     cdnRegistry : ?string
 |};
 
-export const info = memoizePromise(async (moduleName : string, opts : InfoOptions) : Promise<Package> => {
+type InfoResults = {|
+    moduleInfo : Package,
+    fetchedFromCDNRegistry : boolean
+|};
+
+export const info = memoizePromise(async (moduleName : string, opts : InfoOptions) : Promise<InfoResults> => {
     const { logger, cache, registry = NPM_REGISTRY, cdnRegistry } = opts;
 
     const sanitizedName = sanitizeString(moduleName);
@@ -64,12 +69,15 @@ export const info = memoizePromise(async (moduleName : string, opts : InfoOption
 
     const cacheKey = `grabthar_npm_info_${ sanitizedName }_${ sanitizedCDNRegistry }`;
 
-    const { name, versions, 'dist-tags': distTags } = await cacheReadWrite(cacheKey, async () => {
+    const { name, versions, fetchedFromCDNRegistry, 'dist-tags': distTags } = await cacheReadWrite(cacheKey, async () => {
         let res;
+        let isFromCDNRegistry = false;
 
         if (cdnRegistry) {
             res = await fetch(`${ cdnRegistry }/${ moduleName.replace('@', '') }/${ CDN_REGISTRY_INFO_FILENAME }?cache-bust=${ Math.floor(Date.now() / CDN_REGISTRY_INFO_CACHEBUST_URL_TIME) }`);
-            if (!res.ok) {
+            if (res.ok) {
+                isFromCDNRegistry = true;
+            } else {
                 logger.warn(`grabthar_cdn_registry_failure`, {
                     cdnRegistry, moduleName, status: res.status
                 });
@@ -85,11 +93,14 @@ export const info = memoizePromise(async (moduleName : string, opts : InfoOption
             throw new Error(`npm returned status ${ res.status || 'unknown' } for ${ registry }/${ moduleName }`);
         }
 
-        return extractInfo(await res.json());
-
+        const infoResults = extractInfo(await res.json());
+        return { ...infoResults, fetchedFromCDNRegistry: isFromCDNRegistry };
     }, { logger, cache });
 
-    return { name, versions, 'dist-tags': distTags };
+    return {
+        moduleInfo: { name, versions, 'dist-tags': distTags },
+        fetchedFromCDNRegistry
+    };
 }, { lifetime: INFO_MEMORY_CACHE_LIFETIME });
 
 type InstallOptions = {|
@@ -103,77 +114,88 @@ type InstallOptions = {|
 |};
 
 export const installSingle = memoizePromise(async (moduleName : string, version : string, opts : InstallOptions) : Promise<void> => {
-
     if (!isValidDependencyVersion(version)) {
         throw new Error(`Invalid version for single install: ${ moduleName }@${ version }`);
     }
 
     const { cache, logger, registry = NPM_REGISTRY, cdnRegistry, prefix } = opts;
 
-    const moduleInfo = await info(moduleName, { cache, logger, registry, cdnRegistry });
+    const { moduleInfo, fetchedFromCDNRegistry } = await info(moduleName, { cache, logger, registry, cdnRegistry });
 
     const versionInfo = moduleInfo.versions[version];
-    const tarball = versionInfo.dist.tarball;
+
+    if (!versionInfo) {
+        throw new Error(`No version found for ${ moduleName } @ ${ version } - found ${ Object.keys(moduleInfo.versions).join(', ') }`);
+    }
 
     if (!prefix) {
         throw new Error(`Prefix required for flat install`);
     }
 
-    if (!tarball) {
+    const initialTarball = versionInfo.dist.tarball;
+
+    if (!initialTarball) {
         throw new Error(`Can not find tarball for ${ moduleInfo.name }`);
     }
 
     const nodeModulesDir = join(prefix, NODE_MODULES);
     const packageName = `${ PACKAGE }.tar.gz`;
+    let tarball = initialTarball;
+
+    if (cdnRegistry && fetchedFromCDNRegistry && !tarball.includes(cdnRegistry)) {
+        try {
+            const initialTarballPathname = new URL(tarball).pathname;
+            const newTarballOrigin = new URL(cdnRegistry).origin;
+            tarball = new URL(initialTarballPathname, newTarballOrigin).toString();
+
+        } catch (err) {
+            throw new Error(`Failed to parse tarball url ${ tarball }\n\n${ err.stack }`);
+        }
+
+        logger.info(`grabthar_npm_install_dependency_update_tarball_location`, { cdnRegistry, initialTarball, newTarball: tarball });
+    }
 
     const tmpDir = await getTemporaryDirectory(moduleName);
     const packageDir = join(tmpDir, PACKAGE);
     const moduleDir = join(nodeModulesDir, moduleInfo.name);
     const modulePackageDir = join(moduleDir, PACKAGE_JSON);
-    const moduleLock = join(moduleDir, LOCK);
     const moduleParentDir = join(moduleDir, '..');
 
     if (await exists(modulePackageDir)) {
         return;
     }
 
-    if (existsSync(moduleLock)) {
-        throw new Error(`${ moduleDir } is locked, can not install ${ moduleName }`);
-    }
+    await withFileSystemLock(async () => {
+        await ensureDir(tmpDir);
+        await ensureDir(prefix);
+        await ensureDir(nodeModulesDir);
+        await ensureDir(moduleParentDir);
 
-    await ensureDir(tmpDir);
-    await ensureDir(prefix);
-    await ensureDir(nodeModulesDir);
-    await ensureDir(moduleParentDir);
-
-    ensureFileSync(moduleLock);
-    const lockTimer = setTimeout(() => {
-        tryRemove(moduleLock);
-    }, 60 * 1000);
-
-    if (await exists(moduleDir)) {
-        await rmrf(moduleDir);
-    }
-
-    try {
-        await ensureDir(moduleDir);
-        ensureFileSync(moduleLock);
-
-        await download(tarball, tmpDir, { extract: true, filename: packageName });
-        await move(packageDir, moduleDir, { overwrite: true });
-
-        if (!await exists(modulePackageDir)) {
-            throw new Error(`Package not found at ${ modulePackageDir }`);
+        if (await exists(moduleDir)) {
+            for (const file of await readdir(moduleDir)) {
+                if (file === LOCK) {
+                    continue;
+                }
+                await rmrf(join(moduleDir, file));
+            }
         }
-    } catch (err) {
-        await rmrf(moduleDir);
-        throw err;
-    } finally {
-        tryRemove(moduleLock);
-        clearTimeout(lockTimer);
-    }
 
-    await tryRmrf(tmpDir);
+        await ensureDir(moduleDir);
+
+        try {
+            await download(tarball, tmpDir, { extract: true, filename: packageName });
+            await move(packageDir, moduleDir, { overwrite: true });
+
+            if (!await exists(modulePackageDir)) {
+                throw new Error(`Package not found at ${ modulePackageDir }`);
+            }
+        } catch (err) {
+            await rmrf(moduleDir);
+            throw new Error(`Failed to download ${ tarball }\n\n${ err.stack }`);
+        }
+
+        await tryRmrf(tmpDir);
+    }, moduleDir);
 });
 
 export const install = async (moduleName : string, version : string, opts : InstallOptions) : Promise<void> => {
@@ -184,10 +206,10 @@ export const install = async (moduleName : string, version : string, opts : Inst
         const tasks = [];
 
         if (dependencies) {
-            const moduleInfo = await info(moduleName, { cache, logger, registry, cdnRegistry });
+            const { moduleInfo } = await info(moduleName, { cache, logger, registry, cdnRegistry });
             const dependencyVersions = moduleInfo.versions[version].dependencies;
 
-            
+
             logger.info(`grabthar_npm_install_dependencies_${ sanitizedName }`, { version, registry, dependencies: Object.keys(dependencyVersions).join(',') });
 
             for (const dependencyName of Object.keys(dependencyVersions)) {
